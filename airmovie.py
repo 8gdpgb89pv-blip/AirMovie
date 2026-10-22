@@ -3,7 +3,7 @@
 Normally started by the AirMovie.app launcher; or run: python3 airmovie.py [movie file]
 First start installs everything it needs (PyObjC + ffmpeg) into ~/.airmovie-venv by itself.
 """
-import os, sys, subprocess, shutil, tempfile, atexit, threading, uuid, json, struct, plistlib
+import os, sys, subprocess, shutil, tempfile, atexit, threading, uuid, json, struct, plistlib, time
 import urllib.request, urllib.parse, urllib.error, socket, secrets, http.server, mimetypes
 
 
@@ -124,7 +124,7 @@ def fmt(s):
 
 # ---------- settings, OpenSubtitles, click-to-run launcher ----------
 D = NSUserDefaults.alloc().initWithSuiteName_("com.airmovie.app")
-DEFAULTS = {"apiKey": "", "user": "", "lang": "en", "auto": False, "mode": 0, "skip": 10, "resume": True}
+DEFAULTS = {"apiKey": "", "user": "", "lang": "en", "auto": False, "mode": 0, "skip": 10, "resume": True, "stopSleep": True}
 LANGS = {"English": "en", "German": "de", "Turkish": "tr", "Croatian": "hr", "Serbian": "sr", "Bosnian": "bs",
          "French": "fr", "Spanish": "es", "Italian": "it", "Polish": "pl", "Russian": "ru", "Arabic": "ar",
          "Portuguese": "pt-PT", "Dutch": "nl"}
@@ -365,6 +365,9 @@ class Controller(NSObject):
         self.player.setAllowsExternalPlayback_(True)
         self.dur, self.scrubbing, self.hold, self.was_playing, self.last_tmp = 0.0, False, 0, None, None
         self.cur, self.todo, self.n, self.results, self.prefwin = None, None, 0, [], None
+        self.caf = None
+        NSWorkspace.sharedWorkspace().notificationCenter().addObserver_selector_name_object_(self, "willSleep:", NSWorkspaceWillSleepNotification, None)
+        self.lid, self.paused_since = 0, None  # lid mode: 0 off, 1 asking for password, 2 armed, 3 declined
 
         W, H, BAR = 960, 600, 48
         style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
@@ -554,6 +557,9 @@ class Controller(NSObject):
         put("skip", int(self.f_skip.titleOfSelectedItem()))
         put("auto", self.f_auto.state() == 1)
         put("resume", self.f_res.state() == 1)
+        put("stopSleep", self.f_sleep.state() == 1)
+        if self.lid == 3:
+            self.lid = 0  # allow a new attempt
 
     @objc.python_method
     def search_bg(self, lang):
@@ -575,8 +581,8 @@ class Controller(NSObject):
     def settings_(self, sender):
         if self.prefwin is not None and self.prefwin.isVisible():
             return self.prefwin.makeKeyAndOrderFront_(None)
-        win = self.prefwin = self.make_window("Settings", 470, 340)
-        v, y = win.contentView(), [296]
+        win = self.prefwin = self.make_window("Settings", 470, 370)
+        v, y = win.contentView(), [326]
 
         def row(label, ctl, w=270):
             t = NSTextField.labelWithString_(label)
@@ -610,10 +616,43 @@ class Controller(NSObject):
         self.f_skip = row("Skip button (seconds)", popup(["5", "10", "15", "30"], ["5", "10", "15", "30"].index(str(cfg("skip")))))
         self.f_auto = row("", check("Auto-download subtitle on open", cfg("auto")))
         self.f_res = row("", check("Resume where I left off", cfg("resume")))
+        self.f_sleep = row("", check("Stop playback when lid closes / Mac sleeps", cfg("stopSleep")))
         note = NSTextField.labelWithString_("Free API key + account: opensubtitles.com (Consumers). Saved when you close this window.")
         note.setFont_(NSFont.systemFontOfSize_(10))
         note.setFrame_(((16, 8), (440, 16)))
         v.addSubview_(note)
+
+    def willSleep_(self, note):  # lid closed / Mac going to sleep
+        self.player.pause()
+
+    @objc.python_method
+    def arm_lid(self):
+        self.lid = 1
+        flag = os.path.join(TMP, "awake.flag")
+        open(flag, "w").close()
+        cmd = ("/usr/bin/pmset -a disablesleep 1; (while kill -0 %d 2>/dev/null && [ -e %s ]; do sleep 3; done; "
+               "/usr/bin/pmset -a disablesleep 0) >/dev/null 2>&1 &" % (os.getpid(), flag))
+
+        def work():
+            r = subprocess.run(["osascript", "-e", 'do shell script "%s" with administrator privileges' % cmd], capture_output=True)
+            out = subprocess.run(["pmset", "-g"], capture_output=True, text=True).stdout
+            AppHelper.callAfter(self.lid_done, r.returncode == 0 and bool(re.search(r"SleepDisabled\s+1", out)))
+        threading.Thread(target=work, daemon=True).start()
+
+    @objc.python_method
+    def lid_done(self, ok):
+        self.lid, self.paused_since = (2 if ok else 3), None
+        if not ok:
+            dialog("Lid-closed mode was not enabled (password cancelled or refused). Playback will stop when you close the lid. "
+                   "Change a setting and close the Settings window to try again.", 30)
+
+    @objc.python_method
+    def disarm_lid(self):
+        try:
+            os.remove(os.path.join(TMP, "awake.flag"))  # the watchdog sees this and restores normal sleep
+        except OSError:
+            pass
+        self.lid, self.paused_since = 0, None
 
     def windowWillClose_(self, note):
         if self.prefwin is not None and note.object() == self.prefwin:
@@ -720,6 +759,23 @@ class Controller(NSObject):
             self.play_btn.setImage_(NSImage.imageWithSystemSymbolName_accessibilityDescription_("pause.fill" if playing else "play.fill", None))
         ext, st = self.player.isExternalPlaybackActive(), self.player.timeControlStatus()
         self.window.setSubtitle_("" if not ext else "AirPlay: waiting for the TV to load the video..." if st == 1 else "Playing on AirPlay device")
+        want_awake = playing and not cfg("stopSleep")
+        if want_awake and self.caf is None:
+            self.caf = subprocess.Popen(["caffeinate", "-s", "-i", "-w", str(os.getpid())])
+        elif not want_awake and self.caf is not None:
+            self.caf.terminate()
+            self.caf = None
+        if not cfg("stopSleep") and playing and self.lid == 0:
+            self.arm_lid()
+        if self.lid == 2:
+            if playing:
+                self.paused_since = None
+            else:
+                self.paused_since = self.paused_since or time.time()
+                if time.time() - self.paused_since > 300:  # paused / finished for 5 minutes: back to normal sleep
+                    self.disarm_lid()
+        if cfg("stopSleep") and self.lid in (1, 2):
+            self.disarm_lid()
 
     def applicationShouldTerminateAfterLastWindowClosed_(self, app):
         return True
